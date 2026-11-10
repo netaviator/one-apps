@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'erb'
+require 'resolv'
 require 'uri'
 require_relative '../vrouter.rb'
 
@@ -15,6 +16,13 @@ module MgmtVRF
     RULE_PREF = 100
 
     ONEAPP_VNF_MGMT_VRF_ENABLED = env :ONEAPP_VNF_MGMT_VRF_ENABLED, 'YES'
+
+    # Removes every rule of this module, whichever addresses they were added for: the name of the OneGate host
+    # may resolve differently now, and the resolver may sit behind the VRF.
+    RULE_PURGE = "while ip rule del pref #{RULE_PREF} 2>/dev/null; do :; done\n" \
+                 "while ip -6 rule del pref #{RULE_PREF} 2>/dev/null; do :; done"
+
+    HOSTNAME_RE = /\A(?=.{1,253}\z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\z/
 
     IPV4_RE = /\A(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\z/
 
@@ -71,7 +79,6 @@ module MgmtVRF
         statics = static_routes nics
         addrs6  = ip6_addresses nics
         routes6 = default_routes6 nics
-        leak    = onegate_rule
         others  = other_default_routes nics
 
         # NOTE: Let sshd and other listeners of the default VRF accept connections on the NIC of the VRF.
@@ -108,11 +115,11 @@ module MgmtVRF
             <%- others[:v6].each do |nic, gateway| -%>
             <%= default_if_missing nic, gateway, v6: true %>
             <%- end -%>
-            <%- unless leak.nil? -%>
-            <%= leak[:del] %>
-            <%= leak[:add] %>
-            <%- end -%>
         SCRIPT
+
+        # NOTE: After the NIC and its routes are in the VRF: a host name is looked up through the VRF.
+        rules = onegate_rules
+        bash ([RULE_PURGE] + rules).join("\n") unless rules.empty?
 
         toggle [:reload]
     end
@@ -120,7 +127,6 @@ module MgmtVRF
     def cleanup(basedir: '/etc/sysctl.d')
         msg :info, 'MgmtVRF::cleanup'
 
-        leak    = onegate_rule
         nics    = detect_mgmt_nics.sort_by { |nic| nic[/\d+/].to_i }
         routes  = default_routes nics
         routes6 = default_routes6 nics
@@ -135,9 +141,7 @@ module MgmtVRF
             if ip link show '<%= VRF_NAME %>' >/dev/null 2>&1; then
                 ip link del '<%= VRF_NAME %>'
             fi
-            <%- unless leak.nil? -%>
-            <%= leak[:del] %>
-            <%- end -%>
+            <%= RULE_PURGE %>
             <%- addrs6.each do |nic, addrs| -%>
             <%- addrs.each do |addr| -%>
             ip -6 addr replace '<%= addr %>' dev '<%= nic %>'
@@ -164,25 +168,52 @@ module MgmtVRF
     end
 
     # NOTE: The appliance talks to OneGate from the default VRF, which cannot reach hosts behind the
-    #       management NIC any more. A policy rule sends the traffic for the OneGate address to the VRF
-    #       table, and the lookup falls through to the main table when the VRF has no route for it.
-    #       Only an IP literal is accepted, since the address ends up in a shell command.
-    def onegate_rule
+    #       management NIC any more. A policy rule per OneGate address sends that traffic to the VRF table, and
+    #       the lookup falls through to the main table when the VRF has no route for it. The endpoint may be an
+    #       IP literal or a host name; a name is looked up through the VRF, where the resolver of the management
+    #       network is reachable, and in the default VRF when that gives no answer. Every address ends up in a
+    #       shell command, so only plain IPv4 and IPv6 notation is accepted.
+    def onegate_rules
         host = URI.parse(env(:ONEGATE_ENDPOINT, '').to_s).hostname.to_s
 
-        if IPV4_RE.match?(host)
-            ip, family, plen = host, 'ip', 32
-        elsif valid_ipv6?(host)
-            ip, family, plen = host, 'ip -6', 128
-        else
-            return nil
-        end
-
-        spec = "pref #{RULE_PREF} to '#{ip}/#{plen}' lookup #{VRF_TABLE}"
-
-        { del: "#{family} rule del #{spec} 2>/dev/null ||:", add: "#{family} rule add #{spec}" }
+        onegate_addresses(host).filter_map do |address|
+            if IPV4_RE.match?(address)
+                "ip rule add pref #{RULE_PREF} to '#{address}/32' lookup #{VRF_TABLE}"
+            elsif valid_ipv6?(address)
+                "ip -6 rule add pref #{RULE_PREF} to '#{address}/128' lookup #{VRF_TABLE}"
+            else
+                msg :error, "MgmtVRF::execute: ignoring the address #{address[0, 40].inspect} of the OneGate host, no rule"
+                nil
+            end
+        end.uniq
     rescue URI::InvalidURIError
-        nil
+        []
+    end
+
+    def onegate_addresses(host)
+        return [] if host.empty?
+        return [host] if IPV4_RE.match?(host) || valid_ipv6?(host)
+        # Digits and dots only: a malformed address, not a name.
+        return [] unless HOSTNAME_RE.match?(host) && !/\A[\d.]+\z/.match?(host)
+
+        addresses = resolve(host)
+        msg :error, "MgmtVRF::execute: cannot resolve the OneGate host #{host[0, 60].inspect}, no rule" if addresses.empty?
+        addresses
+    end
+
+    # Both families (A and AAAA); never raises. The host name matched HOSTNAME_RE, so it is safe in quotes.
+    def resolve(host)
+        addresses = resolve_in_vrf(host)
+
+        addresses.empty? ? Resolv.getaddresses(host) : addresses
+    rescue StandardError
+        []
+    end
+
+    def resolve_in_vrf(host)
+        bash("ip vrf exec '#{VRF_NAME}' ruby -rresolv -e 'puts Resolv.getaddresses(ARGV[0])' '#{host}'").split
+    rescue StandardError
+        []
     end
 
     # NOTE: one-context adds the default route of every NIC with `ip route add`, so the first NIC wins and

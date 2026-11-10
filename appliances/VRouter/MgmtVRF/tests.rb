@@ -20,6 +20,7 @@ RSpec.describe self do
         allow(Service::MgmtVRF).to receive(:bash) { |script| scripts << script; '' }
         allow(Service::MgmtVRF).to receive(:toggle)
         allow(Service::MgmtVRF).to receive(:msg) { |level, text| @errors << text if level == :error }
+        allow(Service::MgmtVRF).to receive(:resolve) { |host| resolutions.fetch(host, []) }
 
         Dir.mktmpdir do |dir|
             Service::MgmtVRF.execute basedir: dir
@@ -29,6 +30,7 @@ RSpec.describe self do
         @scripts.flat_map(&:lines).map(&:strip).reject(&:empty?)
     end
 
+    let(:resolutions) { {} }
     let(:mgmt) { { 'ETH0_VROUTER_MANAGEMENT' => 'YES', 'ETH0_IP' => '172.20.128.210', 'ETH0_GATEWAY' => '172.20.128.1' } }
 
     it 'should create the VRF and move the management NIC into it' do
@@ -232,14 +234,13 @@ RSpec.describe self do
             expect(cmds).to include("ip -6 rule add pref 100 to 'fd00::1/128' lookup 1000")
         end
 
-        it 'should remove a former rule first so that running twice does not pile up rules' do
+        it 'should remove every former rule first so that running twice does not pile up rules' do
             cmds = run_execute(mgmt.merge('ONEGATE_ENDPOINT' => 'http://10.0.2.2:5030'))
 
-            del = cmds.index { |c| c.start_with?("ip rule del pref 100 to '10.0.2.2/32' lookup 1000") }
-            add = cmds.index { |c| c.start_with?("ip rule add") }
+            add = cmds.index { |c| c.start_with?('ip rule add') }
 
-            expect(del).not_to be_nil
-            expect(del).to be < add
+            expect(cmds.index('while ip rule del pref 100 2>/dev/null; do :; done')).to be < add
+            expect(cmds.index('while ip -6 rule del pref 100 2>/dev/null; do :; done')).to be < add
         end
 
         it 'should add the rule after the NIC moved into the VRF' do
@@ -252,7 +253,90 @@ RSpec.describe self do
             expect(run_execute(mgmt).grep(/ip (-6 )?rule/)).to be_empty
         end
 
-        ['http://onegate.example.com:5030', 'http://10.0.2.2;reboot:5030', 'http://999.1.1.1:5030', 'not a uri', 'http://[fd00::1%25eth0]:5030'].each do |bad|
+        describe 'name resolution' do
+            before { clear_env; load './main.rb'; include Service::MgmtVRF }
+
+            it 'should ask the resolver inside the VRF first' do
+                commands = []
+                allow(Service::MgmtVRF).to receive(:bash) { |cmd| commands << cmd; "10.0.2.2\nfd00::1\n" }
+
+                expect(Service::MgmtVRF.resolve('onegate.example.com')).to eq %w[10.0.2.2 fd00::1]
+                expect(commands.first).to start_with("ip vrf exec 'mgmt' ")
+                expect(commands.first).to include("'onegate.example.com'")
+            end
+
+            it 'should fall back to the default VRF when the VRF has no answer' do
+                allow(Service::MgmtVRF).to receive(:bash).and_return('')
+                allow(Resolv).to receive(:getaddresses).with('onegate.example.com').and_return(%w[10.0.2.9])
+
+                expect(Service::MgmtVRF.resolve('onegate.example.com')).to eq %w[10.0.2.9]
+            end
+
+            it 'should fall back when the lookup inside the VRF fails' do
+                allow(Service::MgmtVRF).to receive(:bash).and_raise(RuntimeError, 'exit 1')
+                allow(Resolv).to receive(:getaddresses).with('onegate.example.com').and_return(%w[10.0.2.9])
+
+                expect(Service::MgmtVRF.resolve('onegate.example.com')).to eq %w[10.0.2.9]
+            end
+
+            it 'should return nothing when neither lookup works' do
+                allow(Service::MgmtVRF).to receive(:bash).and_raise(RuntimeError, 'exit 1')
+                allow(Resolv).to receive(:getaddresses).and_raise(Resolv::ResolvError)
+
+                expect(Service::MgmtVRF.resolve('onegate.example.com')).to eq []
+            end
+        end
+
+        context 'with a host name' do
+            let(:endpoint) { { 'ONEGATE_ENDPOINT' => 'http://onegate.example.com:5030' } }
+
+            it 'should route every resolved IPv4 and IPv6 address through the VRF table' do
+                resolutions['onegate.example.com'] = %w[10.0.2.2 10.0.2.3 fd00::1]
+
+                cmds = run_execute(mgmt.merge(endpoint))
+
+                expect(cmds).to include("ip rule add pref 100 to '10.0.2.2/32' lookup 1000",
+                                        "ip rule add pref 100 to '10.0.2.3/32' lookup 1000",
+                                        "ip -6 rule add pref 100 to 'fd00::1/128' lookup 1000")
+            end
+
+            it 'should resolve the name only after the NIC moved into the VRF, so that the lookup can go through it' do
+                moved = false
+                resolved_after_move = nil
+                allow(Service::MgmtVRF).to receive(:bash) { |script| moved = true if script.include?('master'); '' }
+                allow(Service::MgmtVRF).to receive(:resolve) { resolved_after_move = moved; [] }
+
+                ENV['ETH0_VROUTER_MANAGEMENT'] = 'YES'
+                ENV['ONEGATE_ENDPOINT'] = endpoint['ONEGATE_ENDPOINT']
+                Dir.mktmpdir { |dir| Service::MgmtVRF.execute basedir: dir }
+
+                expect(resolved_after_move).to be(true)
+            end
+
+            it 'should skip an answer that is not a plain address' do
+                resolutions['onegate.example.com'] = ['10.0.2.2', '10.0.2.3;reboot', 'fe80::1%eth0', '999.1.1.1']
+
+                cmds = run_execute(mgmt.merge(endpoint))
+
+                expect(cmds.grep(/ip (-6 )?rule add/)).to eq ["ip rule add pref 100 to '10.0.2.2/32' lookup 1000"]
+                expect(@scripts.join).not_to include('reboot')
+            end
+
+            it 'should log an error and add no rule when the name does not resolve' do
+                cmds = run_execute(mgmt.merge(endpoint))
+
+                expect(cmds.grep(/ip (-6 )?rule add/)).to be_empty
+                expect(@errors.join).to include('onegate.example.com')
+            end
+
+            it 'should not look up the name when it is an address' do
+                expect(Service::MgmtVRF).not_to receive(:resolve)
+
+                run_execute(mgmt.merge('ONEGATE_ENDPOINT' => 'http://10.0.2.2:5030'))
+            end
+        end
+
+        ['http://10.0.2.2;reboot:5030', 'http://999.1.1.1:5030', 'not a uri', 'http://[fd00::1%25eth0]:5030', 'http://bad_name$(reboot):5030'].each do |bad|
             it "should add no rule for the endpoint #{bad.inspect}" do
                 cmds = run_execute(mgmt.merge('ONEGATE_ENDPOINT' => bad))
 
@@ -443,10 +527,11 @@ RSpec.describe self do
             expect(run_cleanup).to include("ip link del 'mgmt'")
         end
 
-        it 'should delete the OneGate rule' do
-            cmds = run_cleanup('ONEGATE_ENDPOINT' => 'http://10.0.2.2:5030')
+        it 'should delete every OneGate rule, whatever the name resolved to when it was added' do
+            cmds = run_cleanup('ONEGATE_ENDPOINT' => 'http://onegate.example.com:5030')
 
-            expect(cmds).to include("ip rule del pref 100 to '10.0.2.2/32' lookup 1000 2>/dev/null ||:")
+            expect(cmds).to include('while ip rule del pref 100 2>/dev/null; do :; done',
+                                    'while ip -6 rule del pref 100 2>/dev/null; do :; done')
         end
 
         it 'should remove the sysctl file' do
